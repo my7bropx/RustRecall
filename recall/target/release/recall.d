@@ -1,0 +1,1 @@
+/home/my7bropxqi/Desktop/ACTIVE/RustFZF/recall/target/release/recall: /home/my7bropxqi/Desktop/ACTIVE/RustFZF/recall/src/app.rs /home/my7bropxqi/Desktop/ACTIVE/RustFZF/recall/src/db.rs /home/my7bropxqi/Desktop/ACTIVE/RustFZF/recall/src/main.rs /home/my7bropxqi/Desktop/ACTIVE/RustFZF/recall/src/models.rs /home/my7bropxqi/Desktop/ACTIVE/RustFZF/recall/src/ui.rs

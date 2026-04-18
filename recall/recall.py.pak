@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""recall — vim-native terminal knowledge base"""
+
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+from rapidfuzz import fuzz
+from rich.markup import escape as esc
+from textual import events
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Input, Label, ListItem, ListView, Static, TextArea
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+DB_PATH   = Path.home() / ".local" / "share" / "recall" / "recall.db"
+ALL_CATS  = ["command", "note", "tool"]
+CAT_LABEL = {"command": "CMD ", "note": "NOTE", "tool": "TOOL"}
+CAT_COLOR = {"command": "green", "note": "yellow", "tool": "cyan"}
+
+class Mode(Enum):
+    NORMAL  = "NORMAL"
+    SEARCH  = "SEARCH"
+    COMMAND = "COMMAND"
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+class DB:
+    def __init__(self, path: Path = DB_PATH):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(path))
+        self.conn.row_factory = sqlite3.Row
+        self._init()
+
+    def _init(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS entries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT NOT NULL,
+                content     TEXT NOT NULL DEFAULT '',
+                category    TEXT NOT NULL DEFAULT 'note',
+                tags        TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+        """)
+        self.conn.commit()
+
+    def _row(self, row) -> dict:
+        r = dict(row)
+        r["tags"] = [t.strip() for t in r["tags"].split(",") if t.strip()] if r["tags"] else []
+        return r
+
+    def all(self) -> list[dict]:
+        return [self._row(r) for r in self.conn.execute(
+            "SELECT * FROM entries ORDER BY updated_at DESC"
+        ).fetchall()]
+
+    def add(self, title, content, category, tags) -> int:
+        now = _now()
+        cur = self.conn.execute(
+            "INSERT INTO entries (title,content,category,tags,created_at,updated_at) VALUES (?,?,?,?,?,?)",
+            (title, content, category, ",".join(t.strip() for t in tags if t.strip()), now, now),
+        )
+        self.conn.commit()
+        return cur.lastrowid  # type: ignore
+
+    def update(self, id, title, content, category, tags):
+        self.conn.execute(
+            "UPDATE entries SET title=?,content=?,category=?,tags=?,updated_at=? WHERE id=?",
+            (title, content, category, ",".join(t.strip() for t in tags if t.strip()), _now(), id),
+        )
+        self.conn.commit()
+
+    def delete(self, id):
+        self.conn.execute("DELETE FROM entries WHERE id=?", (id,))
+        self.conn.commit()
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+# ── Fuzzy filter ──────────────────────────────────────────────────────────────
+
+def fuzzy_filter(entries: list[dict], query: str, cat: Optional[str]) -> list[dict]:
+    if cat:
+        entries = [e for e in entries if e["category"] == cat]
+    q = query.strip().lower()
+    if not q:
+        return entries
+    def score(e):
+        hay = f"{e['title']} {' '.join(e['tags'])} {e['content'][:400]}".lower()
+        return fuzz.partial_ratio(q, hay)
+    scored = [(e, score(e)) for e in entries]
+    scored = [(e, s) for e, s in scored if s > 55]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [e for e, _ in scored]
+
+
+# ── Preview renderer ──────────────────────────────────────────────────────────
+
+def render_preview(entry: dict, width: int = 60) -> str:
+    cat   = entry["category"]
+    cc    = CAT_COLOR[cat]
+    label = CAT_LABEL[cat]
+    tags  = ", ".join(entry["tags"]) or "(none)"
+    sep   = "─" * min(width - 4, 54)
+
+    lines = [
+        f"  [dim]Title    [/dim][bold {cc}]{esc(entry['title'])}[/bold {cc}]",
+        f"  [dim]Category [/dim][{cc}]{label}[/{cc}]",
+        f"  [dim]Tags     [/dim][cyan]{esc(tags)}[/cyan]",
+        f"  [dim]Updated  [/dim][dim]{esc(entry['updated_at'])}[/dim]",
+        f"  [dim]{sep}[/dim]",
+        "",
+    ]
+
+    in_code = False
+    for line in entry["content"].splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            lang    = stripped[3:].strip()
+            bar     = f"  {lang} " if lang else "  "
+            lines.append(f"  [dim]{'━'*min(width-4,54)}[/dim]  [dim]{esc(lang)}[/dim]" if lang
+                          else f"  [dim]{'━'*min(width-4,54)}[/dim]")
+            continue
+        if in_code:
+            lines.append(f"  [bold green]  {esc(line)}[/bold green]")
+        else:
+            lines.append(f"  {esc(line)}")
+
+    return "\n".join(lines)
+
+
+# ── Clipboard yank ────────────────────────────────────────────────────────────
+
+def yank_to_clipboard(text: str) -> str:
+    for cmd in [
+        ["xclip", "-selection", "clipboard"],
+        ["xsel",  "--clipboard", "--input"],
+        ["wl-copy"],
+    ]:
+        try:
+            p = subprocess.run(cmd, input=text.encode(), capture_output=True)
+            if p.returncode == 0:
+                return f"yanked via {cmd[0]}"
+        except FileNotFoundError:
+            continue
+    return "install xclip / xsel / wl-copy for clipboard"
+
+
+# ── Help Modal ────────────────────────────────────────────────────────────────
+
+HELP_TEXT = """\
+[bold cyan]  ◈  recall — keybindings[/bold cyan]
+
+  [bold white]NORMAL[/bold white]
+  [cyan]j / k[/cyan]          down / up
+  [cyan]gg[/cyan]             jump to top
+  [cyan]G[/cyan]              jump to bottom
+  [cyan]Ctrl+d / Ctrl+u[/cyan]  5 lines down / up
+  [cyan]Enter[/cyan]          open full view
+  [cyan]a[/cyan]              add new entry
+  [cyan]e[/cyan]              edit selected
+  [cyan]dd[/cyan]             delete selected
+  [cyan]yy[/cyan]             yank content to clipboard
+  [cyan]1 2 3 4[/cyan]        filter: all / cmd / note / tool
+  [cyan]Tab[/cyan]            cycle category filter
+  [cyan]/[/cyan]              enter SEARCH mode
+  [cyan]:[/cyan]              enter COMMAND mode
+  [cyan]q[/cyan]              quit
+  [cyan]?[/cyan]              this help
+
+  [bold white]SEARCH[/bold white]  [dim](after /)[/dim]
+  [cyan]typing[/cyan]         live fuzzy filter
+  [cyan]Enter[/cyan]          keep filter, back to NORMAL
+  [cyan]Esc[/cyan]            clear filter, back to NORMAL
+  [cyan]Backspace[/cyan]      delete last char
+
+  [bold white]COMMAND[/bold white]  [dim](after :)[/dim]
+  [cyan]:q[/cyan]             quit
+  [cyan]Esc[/cyan]            cancel
+
+  [bold white]VIEW[/bold white]
+  [cyan]j / k[/cyan]          scroll
+  [cyan]gg / G[/cyan]         top / bottom
+  [cyan]Ctrl+d / Ctrl+u[/cyan]  page scroll
+  [cyan]yy[/cyan]             yank content
+  [cyan]e[/cyan]              edit entry
+  [cyan]q / Esc[/cyan]        back to list
+
+  [bold white]FORM — NAV mode[/bold white]
+  [cyan]j / k[/cyan]          move between fields
+  [cyan]i / Enter[/cyan]      edit selected field  [dim]→ INSERT[/dim]
+  [cyan]← / →[/cyan]          cycle category
+  [cyan]ZZ[/cyan]             save and close
+  [cyan]:w[/cyan]             save and close
+  [cyan]q / :q[/cyan]         cancel
+  [cyan]Ctrl+O[/cyan]         open $EDITOR for content
+
+  [bold white]FORM — INSERT mode[/bold white]
+  [cyan]Esc[/cyan]            exit INSERT → NAV
+
+  [dim]any key to close[/dim]
+"""
+
+class HelpModal(ModalScreen):
+    DEFAULT_CSS = """
+    HelpModal { align: center middle; }
+    #help-box { background: #0d0d1a; border: solid #00d4aa; padding: 1 2; width: 58; height: auto; max-height: 92%; }
+    """
+    def compose(self) -> ComposeResult:
+        with Container(id="help-box"):
+            yield Static(HELP_TEXT, markup=True)
+
+    def on_key(self, event: events.Key) -> None:
+        event.stop()
+        self.dismiss()
+
+
+# ── Confirm Modal ─────────────────────────────────────────────────────────────
+
+class ConfirmModal(ModalScreen):
+    DEFAULT_CSS = """
+    ConfirmModal { align: center middle; }
+    #cb { background: #0d0d1a; border: solid red; padding: 1 3; width: 54; height: auto; }
+    """
+    def __init__(self, msg: str):
+        super().__init__()
+        self._msg = msg
+
+    def compose(self) -> ComposeResult:
+        with Container(id="cb"):
+            yield Static(
+                f"[bold red]{esc(self._msg)}[/bold red]\n\n"
+                "  [dim]y[/dim]  confirm     [dim]n / Esc[/dim]  cancel",
+                markup=True,
+            )
+
+    def on_key(self, event: events.Key) -> None:
+        event.stop()
+        self.dismiss(event.key in ("y", "Y"))
+
+
+# ── View Modal ────────────────────────────────────────────────────────────────
+
+class ViewModal(ModalScreen):
+    DEFAULT_CSS = """
+    ViewModal { align: center middle; }
+    #vm-outer { background: #0d0d1a; border: solid #00d4aa; width: 92%; height: 90%; }
+    #vm-bar   { height: 1; background: #070710; padding: 0 2; border-bottom: solid #1a1a2e; }
+    #vm-scroll { height: 1fr; }
+    #vm-content { height: auto; padding: 1 0; }
+    #vm-hint  { height: 1; background: #030308; padding: 0 2; color: #2a2a4a; }
+    """
+
+    def __init__(self, entry: dict):
+        super().__init__()
+        self._entry   = entry
+        self._pending = ""   # for gg / yy multi-key
+
+    def compose(self) -> ComposeResult:
+        cat = self._entry["category"]
+        cc  = CAT_COLOR[cat]
+        lbl = CAT_LABEL[cat]
+        with Container(id="vm-outer"):
+            yield Static(
+                f"[{cc}]{lbl}[/{cc}]  [bold white]{esc(self._entry['title'])}[/bold white]",
+                id="vm-bar", markup=True,
+            )
+            with ScrollableContainer(id="vm-scroll"):
+                yield Static(render_preview(self._entry, 90), id="vm-content", markup=True)
+            yield Static(
+                "  j/k scroll   gg/G top/btm   Ctrl+d/u page   yy yank   e edit   q back",
+                id="vm-hint",
+            )
+
+    def on_key(self, event: events.Key) -> None:
+        event.stop()
+        k  = event.key
+        sc = self.query_one("#vm-scroll", ScrollableContainer)
+
+        # multi-key
+        if self._pending == "g" and k == "g":
+            self._pending = ""
+            sc.scroll_home(animate=False)
+            return
+        if self._pending == "y" and k == "y":
+            self._pending = ""
+            self.dismiss(f"status:{yank_to_clipboard(self._entry['content'])}")
+            return
+        if k in ("g", "y"):
+            self._pending = k
+            return
+        self._pending = ""
+
+        if k in ("q", "escape"):
+            self.dismiss(None)
+        elif k == "e":
+            self.dismiss("edit")
+        elif k in ("j", "down"):
+            sc.scroll_down(animate=False)
+        elif k in ("k", "up"):
+            sc.scroll_up(animate=False)
+        elif k == "ctrl+d":
+            for _ in range(5): sc.scroll_down(animate=False)
+        elif k == "ctrl+u":
+            for _ in range(5): sc.scroll_up(animate=False)
+        elif k == "G":
+            sc.scroll_end(animate=False)
+
+
+# ── Form Modal ────────────────────────────────────────────────────────────────
+
+FIELD_NAMES  = ["title", "category", "tags", "content"]
+FIELD_LABELS = ["Title   ", "Category", "Tags    ", "Content "]
+
+class FormModal(ModalScreen):
+    DEFAULT_CSS = """
+    FormModal { align: center middle; }
+    #fm-outer {
+        background: #0d0d1a;
+        border: solid #00d4aa;
+        padding: 0 2 1 2;
+        width: 84;
+        height: auto;
+        max-height: 92%;
+    }
+    #fm-header { color: #00d4aa; text-style: bold; height: 2; padding: 1 0 0 0; }
+    .frow      { height: auto; margin-top: 1; }
+    .fcur      { width: 2; color: #00d4aa; }
+    .flbl      { width: 12; color: #2a2a4a; }
+    .flbl.sel  { color: #00d4aa; }
+    #cat-disp  { width: 1fr; }
+    Input      { border: solid #1a1a2e; width: 1fr; }
+    Input:focus{ border: solid #00d4aa; }
+    TextArea   { border: solid #1a1a2e; height: 10; width: 1fr; }
+    TextArea:focus { border: solid #00d4aa; }
+    #fm-status { height: 1; margin-top: 1; }
+    """
+
+    def __init__(self, entry: Optional[dict] = None):
+        super().__init__()
+        self._entry   = entry
+        self._nav_idx = 0
+        self._editing = False
+        self._cat_idx = ALL_CATS.index(entry["category"]) if entry else 0
+        self._cmdbuf  = ""
+        self._zbuf    = ""
+
+    def compose(self) -> ComposeResult:
+        e = self._entry or {}
+        with Container(id="fm-outer"):
+            yield Static(f" ◈  {'Edit' if self._entry else 'Add'} Entry", id="fm-header")
+            with Horizontal(classes="frow"):
+                yield Static(" ", classes="fcur", id="cur-title")
+                yield Static(FIELD_LABELS[0], classes="flbl", id="lbl-title")
+                yield Input(value=e.get("title", ""), id="f-title", placeholder="title...")
+            with Horizontal(classes="frow"):
+                yield Static(" ", classes="fcur", id="cur-category")
+                yield Static(FIELD_LABELS[1], classes="flbl", id="lbl-category")
+                yield Static("", id="cat-disp", markup=True)
+            with Horizontal(classes="frow"):
+                yield Static(" ", classes="fcur", id="cur-tags")
+                yield Static(FIELD_LABELS[2], classes="flbl", id="lbl-tags")
+                yield Input(value=", ".join(e.get("tags", [])), id="f-tags", placeholder="tag1, tag2...")
+            with Horizontal(classes="frow"):
+                yield Static(" ", classes="fcur", id="cur-content")
+                yield Static(FIELD_LABELS[3], classes="flbl", id="lbl-content")
+                yield TextArea(e.get("content", ""), id="f-content")
+            yield Static("", id="fm-status", markup=True)
+
+    def on_mount(self):
+        self._refresh_cat()
+        self._refresh_sel()
+        self._refresh_status()
+
+    # ── Keys ───────────────────────────────────────────────────────────────
+
+    def on_key(self, event: events.Key) -> None:
+        k = event.key
+        c = event.character or ""
+
+        # INSERT mode — only intercept Esc and Ctrl+O
+        if self._editing:
+            if k == "escape":
+                event.stop(); event.prevent_default()
+                self._editing = False
+                self.set_focus(None)
+                self._refresh_status()
+            elif k == "ctrl+o":
+                event.stop(); event.prevent_default()
+                self._run_editor()
+            return
+
+        # NAV mode — consume everything
+        event.stop()
+        event.prevent_default()
+
+        # Command buffer (:w / :q)
+        if self._cmdbuf:
+            if k == "escape":
+                self._cmdbuf = ""
+                self._refresh_status()
+                return
+            self._cmdbuf += c or k
+            if self._cmdbuf == ":w":
+                self._cmdbuf = ""
+                self._save()
+            elif self._cmdbuf == ":q":
+                self._cmdbuf = ""
+                self.dismiss(None)
+            elif len(self._cmdbuf) > 3:
+                self._cmdbuf = ""
+                self._refresh_status()
+            else:
+                self._refresh_status(self._cmdbuf)
+            return
+
+        # ZZ
+        if self._zbuf == "Z" and k == "Z":
+            self._zbuf = ""
+            self._save()
+            return
+        if k == "Z":
+            self._zbuf = "Z"
+            return
+        self._zbuf = ""
+
+        # Navigation
+        if k in ("j", "down", "tab"):
+            self._nav_idx = (self._nav_idx + 1) % 4
+            self._refresh_sel()
+        elif k in ("k", "up", "shift+tab"):
+            self._nav_idx = (self._nav_idx - 1) % 4
+            self._refresh_sel()
+
+        # Enter insert mode or interact
+        elif k in ("i", "a", "enter"):
+            if self._nav_idx == 1:
+                self._cycle_cat(1)
+            else:
+                self._start_insert()
+
+        # Category cycling
+        elif k in ("left",) and self._nav_idx == 1:
+            self._cycle_cat(-1)
+        elif k in ("right",) and self._nav_idx == 1:
+            self._cycle_cat(1)
+
+        # Ctrl+O — open editor on content field
+        elif k == "ctrl+o":
+            self._nav_idx = 3
+            self._refresh_sel()
+            self._run_editor()
+
+        # Command prefix
+        elif c == ":":
+            self._cmdbuf = ":"
+            self._refresh_status(":")
+
+        # Cancel
+        elif k in ("q", "escape"):
+            self.dismiss(None)
+
+    # ── Insert helpers ─────────────────────────────────────────────────────
+
+    def _start_insert(self):
+        wids = ["#f-title", None, "#f-tags", "#f-content"]
+        wid  = wids[self._nav_idx]
+        if wid:
+            self._editing = True
+            self.query_one(wid).focus()
+            self._refresh_status()
+
+    # ── Category ───────────────────────────────────────────────────────────
+
+    def _cycle_cat(self, d: int):
+        self._cat_idx = (self._cat_idx + d) % len(ALL_CATS)
+        self._refresh_cat()
+
+    def _refresh_cat(self):
+        cat = ALL_CATS[self._cat_idx]
+        cc  = CAT_COLOR[cat]
+        lbl = CAT_LABEL[cat]
+        self.query_one("#cat-disp", Static).update(
+            f"  [dim]◀[/dim]  [{cc}]{lbl}[/{cc}]  [dim]▶[/dim]  [dim]← →  or  Enter  to cycle[/dim]"
+        )
+
+    # ── Selection indicator ────────────────────────────────────────────────
+
+    def _refresh_sel(self):
+        for i, name in enumerate(FIELD_NAMES):
+            active = (i == self._nav_idx)
+            self.query_one(f"#cur-{name}", Static).update("▶" if active else " ")
+            lbl = self.query_one(f"#lbl-{name}", Static)
+            if active:
+                lbl.add_class("sel")
+            else:
+                lbl.remove_class("sel")
+        self._refresh_status()
+
+    # ── Status bar ─────────────────────────────────────────────────────────
+
+    def _refresh_status(self, cmd_hint: str = ""):
+        if cmd_hint:
+            self.query_one("#fm-status", Static).update(
+                f"[bold yellow]{esc(cmd_hint)}[/bold yellow][dim]_[/dim]"
+            )
+            return
+        if self._editing:
+            self.query_one("#fm-status", Static).update(
+                "[bold cyan]-- INSERT --[/bold cyan]  [dim]Esc exit   Ctrl+O editor[/dim]"
+            )
+        else:
+            self.query_one("#fm-status", Static).update(
+                "[dim]-- NAV --  j/k move   i edit   ← → cat   ZZ save   :q cancel   Ctrl+O editor[/dim]"
+            )
+
+    # ── Save ──────────────────────────────────────────────────────────────
+
+    def _save(self):
+        title   = self.query_one("#f-title",   Input).value.strip()
+        tags_s  = self.query_one("#f-tags",    Input).value
+        content = self.query_one("#f-content", TextArea).text
+        if not title:
+            self._refresh_status()
+            self.query_one("#fm-status", Static).update("[bold red]title cannot be empty[/bold red]")
+            return
+        self.dismiss({
+            "title":    title,
+            "category": ALL_CATS[self._cat_idx],
+            "tags":     [t.strip() for t in tags_s.split(",") if t.strip()],
+            "content":  content,
+        })
+
+    # ── $EDITOR ───────────────────────────────────────────────────────────
+
+    def _run_editor(self):
+        editor  = os.environ.get("EDITOR", "nano")
+        content = self.query_one("#f-content", TextArea).text
+        with tempfile.NamedTemporaryFile(suffix=".txt", mode="w", delete=False) as f:
+            f.write(content)
+            tmp = f.name
+        self.app.suspend()
+        subprocess.run([editor, tmp])
+        self.app.resume()
+        try:
+            self.query_one("#f-content", TextArea).load_text(Path(tmp).read_text())
+        except Exception:
+            pass
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+        self._nav_idx = 3
+        self._refresh_sel()
+
+
+# ── App CSS ───────────────────────────────────────────────────────────────────
+
+APP_CSS = """
+Screen { background: #07070f; }
+
+#header {
+    height: 1;
+    background: #09091a;
+    padding: 0 1;
+}
+
+#tabs-row {
+    height: 1;
+    background: #09091a;
+    border-bottom: solid #131328;
+}
+
+.tab { width: auto; min-width: 7; height: 1; background: #09091a; color: #222238; padding: 0 1; }
+.tab.on { color: #000010; background: #00d4aa; text-style: bold; }
+
+#body { height: 1fr; }
+
+#list-panel {
+    width: 35%;
+    border-right: solid #131328;
+}
+#list-header { height: 1; background: #0a0a1c; color: #222240; padding: 0 2; }
+
+ListView            { background: #07070f; height: 1fr; }
+ListView > ListItem { padding: 0 1; }
+ListView > ListItem.--highlight { background: #11112a; }
+
+.li-command { color: #00bb55; }
+.li-note    { color: #bbaa00; }
+.li-tool    { color: #0099bb; }
+.li-tags    { color: #222240; }
+
+#preview-panel  { width: 65%; }
+#preview-scroll { height: 1fr; }
+#preview-content{ height: auto; padding: 1 0; }
+
+#cmdline {
+    height: 1;
+    background: #030308;
+    padding: 0 1;
+    color: #222240;
+}
+"""
+
+
+# ── List item ─────────────────────────────────────────────────────────────────
+
+def make_list_item(entry: dict) -> ListItem:
+    cat   = entry["category"]
+    badge = CAT_LABEL[cat]
+    tags  = " ".join(f"#{t}" for t in entry["tags"][:3])
+    li    = ListItem(
+        Label(
+            f"[li-{cat}]{badge}[/li-{cat}]  {esc(entry['title'])}"
+            + (f"  [li-tags]{esc(tags)}[/li-tags]" if tags else ""),
+            markup=True,
+        )
+    )
+    li.id = f"e-{entry['id']}"  # type: ignore
+    return li
+
+
+# ── Main App ──────────────────────────────────────────────────────────────────
+
+class RecallApp(App):
+    CSS   = APP_CSS
+    TITLE = "recall"
+
+    def __init__(self):
+        super().__init__()
+        self.db          = DB()
+        self._all:      list[dict] = []
+        self._filtered: list[dict] = []
+        self._selected   = 0
+        self._mode       = Mode.NORMAL
+        self._search_q   = ""
+        self._cmd_buf    = ""
+        self._cat_filter: Optional[str] = None
+        self._kbuf       = ""       # for gg / dd / yy
+        self._status_msg = ""
+        self._stimer     = None
+
+    # ── Layout ─────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="header", markup=True)
+        with Horizontal(id="tabs-row"):
+            yield Static("ALL",  id="tab-all",  classes="tab on")
+            yield Static("CMD",  id="tab-cmd",  classes="tab")
+            yield Static("NOTE", id="tab-note", classes="tab")
+            yield Static("TOOL", id="tab-tool", classes="tab")
+        with Horizontal(id="body"):
+            with Vertical(id="list-panel"):
+                yield Static("", id="list-header")
+                yield ListView(id="entry-list")
+            with Vertical(id="preview-panel"):
+                with ScrollableContainer(id="preview-scroll"):
+                    yield Static("", id="preview-content", markup=True)
+        yield Static("", id="cmdline", markup=True)
+
+    def on_mount(self):
+        self._reload()
+        self._draw_header()
+        self._draw_cmdline()
+
+    # ── Key handling ───────────────────────────────────────────────────────
+
+    def on_key(self, event: events.Key) -> None:
+        event.stop()
+        event.prevent_default()
+        k = event.key
+        c = event.character or ""
+        {
+            Mode.NORMAL:  self._normal,
+            Mode.SEARCH:  self._search,
+            Mode.COMMAND: self._command,
+        }[self._mode](k, c)
+
+    # ── NORMAL ─────────────────────────────────────────────────────────────
+
+    def _normal(self, k: str, c: str):
+        buf = self._kbuf
+
+        # Multi-key combos
+        if buf == "g" and k == "g":
+            self._kbuf = ""; self._selected = 0; self._sync(); return
+        if buf == "d" and k == "d":
+            self._kbuf = ""; self._do_delete(); return
+        if buf == "y" and k == "y":
+            self._kbuf = ""; self._do_yank(); return
+        if k in ("g", "d", "y"):
+            self._kbuf = k; return
+        self._kbuf = ""
+
+        # Motion
+        if   k in ("j", "down"):  self._move(1)
+        elif k in ("k", "up"):    self._move(-1)
+        elif k == "ctrl+d":       self._move(5)
+        elif k == "ctrl+u":       self._move(-5)
+        elif k == "G":            self._selected = max(0, len(self._filtered)-1); self._sync()
+
+        # Actions
+        elif k == "enter":        self._open_view()
+        elif c == "a":            self._open_form(None)
+        elif c == "e":            self._open_form(self._cur())
+        elif c == "q":            self.exit()
+        elif c == "?":            self.push_screen(HelpModal())
+
+        # Filters
+        elif c == "1":            self._set_cat(None)
+        elif c == "2":            self._set_cat("command")
+        elif c == "3":            self._set_cat("note")
+        elif c == "4":            self._set_cat("tool")
+        elif k == "tab":          self._cycle_cat()
+
+        # Mode switches
+        elif c == "/":
+            self._mode = Mode.SEARCH; self._search_q = ""; self._refresh(); self._draw_cmdline()
+        elif c == ":":
+            self._mode = Mode.COMMAND; self._cmd_buf = ""; self._draw_cmdline()
+        elif k == "escape":
+            if self._search_q:
+                self._search_q = ""; self._selected = 0; self._refresh()
+            self._draw_cmdline()
+
+    # ── SEARCH ─────────────────────────────────────────────────────────────
+
+    def _search(self, k: str, c: str):
+        if k == "escape":
+            self._search_q = ""; self._mode = Mode.NORMAL
+            self._selected = 0; self._refresh(); self._draw_cmdline()
+        elif k == "enter":
+            self._mode = Mode.NORMAL; self._draw_cmdline()
+        elif k == "backspace":
+            self._search_q = self._search_q[:-1]
+            self._selected = 0; self._refresh(); self._draw_cmdline()
+        elif c and len(c) == 1:
+            self._search_q += c; self._selected = 0; self._refresh(); self._draw_cmdline()
+
+    # ── COMMAND ────────────────────────────────────────────────────────────
+
+    def _command(self, k: str, c: str):
+        if k == "escape":
+            self._mode = Mode.NORMAL; self._cmd_buf = ""; self._draw_cmdline()
+        elif k == "enter":
+            cmd = self._cmd_buf.strip()
+            self._mode = Mode.NORMAL; self._cmd_buf = ""
+            if cmd in ("q", "q!"):
+                self.exit()
+            else:
+                self._flash(f"unknown: {cmd}")
+            self._draw_cmdline()
+        elif k == "backspace":
+            self._cmd_buf = self._cmd_buf[:-1]; self._draw_cmdline()
+        elif c and len(c) == 1:
+            self._cmd_buf += c; self._draw_cmdline()
+
+    # ── Actions ────────────────────────────────────────────────────────────
+
+    def _do_delete(self):
+        entry = self._cur()
+        if not entry: return
+        def _done(ok):
+            if ok:
+                self.db.delete(entry["id"]); self._reload()
+                self._flash(f"deleted: {entry['title']}")
+        self.push_screen(ConfirmModal(f"delete: {entry['title']!r} ?"), _done)
+
+    def _do_yank(self):
+        entry = self._cur()
+        if entry:
+            self._flash(yank_to_clipboard(entry["content"]))
+
+    def _open_view(self):
+        entry = self._cur()
+        if not entry: return
+        def _done(result):
+            if isinstance(result, str) and result.startswith("status:"):
+                self._flash(result[7:])
+            elif result == "edit":
+                self._open_form(entry)
+        self.push_screen(ViewModal(entry), _done)
+
+    def _open_form(self, entry: Optional[dict]):
+        if entry is None and not isinstance(entry, dict):
+            pass  # adding new
+        def _done(result):
+            if not result: return
+            if self._cur() and entry:
+                self.db.update(entry["id"], result["title"], result["content"],
+                               result["category"], result["tags"])
+                self._flash(f"updated: {result['title']}")
+            else:
+                self.db.add(result["title"], result["content"],
+                            result["category"], result["tags"])
+                self._flash(f"added: {result['title']}")
+            self._reload()
+        self.push_screen(FormModal(entry), _done)
+
+    # ── Data ───────────────────────────────────────────────────────────────
+
+    def _reload(self):
+        self._all = self.db.all()
+        self._refresh()
+
+    def _refresh(self):
+        self._filtered = fuzzy_filter(self._all, self._search_q, self._cat_filter)
+        if self._selected >= len(self._filtered):
+            self._selected = max(0, len(self._filtered) - 1)
+        lv = self.query_one("#entry-list", ListView)
+        lv.clear()
+        for e in self._filtered:
+            lv.append(make_list_item(e))
+        n = len(self._filtered)
+        self.query_one("#list-header", Static).update(
+            f"  {n} entr{'y' if n == 1 else 'ies'}"
+        )
+        self._sync()
+
+    def _move(self, d: int):
+        if not self._filtered: return
+        self._selected = max(0, min(len(self._filtered)-1, self._selected + d))
+        self._sync()
+
+    def _sync(self):
+        lv = self.query_one("#entry-list", ListView)
+        if self._filtered:
+            lv.index = self._selected
+        self._draw_preview()
+        self._draw_header()
+
+    def _cur(self) -> Optional[dict]:
+        if 0 <= self._selected < len(self._filtered):
+            return self._filtered[self._selected]
+        return None
+
+    # ── Drawing ────────────────────────────────────────────────────────────
+
+    def _draw_preview(self):
+        entry = self._cur()
+        pane  = self.query_one("#preview-content", Static)
+        if not entry:
+            pane.update("[dim]  no entries — press [white]a[/white] to add one[/dim]")
+            return
+        pane.update(render_preview(entry))
+
+    def _draw_header(self):
+        total = len(self._filtered)
+        pos   = (self._selected + 1) if total else 0
+        mc    = {"NORMAL": "#1a3a4a", "SEARCH": "#00aacc", "COMMAND": "#aaaa00"}[self._mode.value]
+        self.query_one("#header", Static).update(
+            f"[bold #00d4aa]  ◈  RECALL[/bold #00d4aa]"
+            f"  [dim]│[/dim]"
+            f"  [bold {mc}]{self._mode.value}[/bold {mc}]"
+            f"  [dim]{pos}/{total}[/dim]"
+        )
+
+    def _draw_cmdline(self):
+        cl = self.query_one("#cmdline", Static)
+        if self._mode == Mode.SEARCH:
+            cl.update(f"[bold white]/[/bold white][cyan]{esc(self._search_q)}[/cyan][bold cyan]█[/bold cyan]")
+        elif self._mode == Mode.COMMAND:
+            cl.update(f"[bold white]:[/bold white][yellow]{esc(self._cmd_buf)}[/yellow][bold yellow]█[/bold yellow]")
+        else:
+            if self._status_msg:
+                cl.update(f"  [#00d4aa]{esc(self._status_msg)}[/#00d4aa]")
+            else:
+                cl.update("  [dim]j/k ↕  /search  a add  e edit  dd del  yy yank  1-4 filter  Tab cycle  ? help  :q quit[/dim]")
+        self._draw_header()
+
+    def _flash(self, msg: str):
+        self._status_msg = msg
+        self._draw_cmdline()
+        if self._stimer:
+            self._stimer.cancel()
+        self._stimer = self.set_timer(2.5, self._clear_flash)
+
+    def _clear_flash(self):
+        self._status_msg = ""
+        self._stimer     = None
+        self._draw_cmdline()
+
+    # ── Filters ────────────────────────────────────────────────────────────
+
+    def _set_cat(self, cat: Optional[str]):
+        self._cat_filter = cat
+        self._selected   = 0
+        self._refresh()
+        slugs = {None: "all", "command": "cmd", "note": "note", "tool": "tool"}
+        for c2, slug in slugs.items():
+            w = self.query_one(f"#tab-{slug}", Static)
+            if c2 == cat: w.add_class("on")
+            else:         w.remove_class("on")
+
+    def _cycle_cat(self):
+        cats = [None] + ALL_CATS
+        idx  = cats.index(self._cat_filter) if self._cat_filter in cats else 0
+        self._set_cat(cats[(idx + 1) % len(cats)])
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def cli():
+    args = sys.argv[1:]
+    if not args:
+        RecallApp().run()
+        return
+    cmd = args[0]
+    if cmd == "add":
+        import argparse
+        p = argparse.ArgumentParser(prog="recall add")
+        p.add_argument("-t", "--title",    required=True)
+        p.add_argument("-c", "--content",  default="")
+        p.add_argument("-C", "--category", default="note", choices=ALL_CATS)
+        p.add_argument("--tags",           default="")
+        ns = p.parse_args(args[1:])
+        DB().add(ns.title, ns.content, ns.category,
+                 [t.strip() for t in ns.tags.split(",") if t.strip()])
+        print(f"added: {ns.title}")
+    elif cmd == "search":
+        if len(args) < 2: print("usage: recall search <query>"); sys.exit(1)
+        for e in fuzzy_filter(DB().all(), " ".join(args[1:]), None):
+            print(f"[{CAT_LABEL[e['category']]}] {e['title']}  |  {', '.join(e['tags'])}")
+    elif cmd == "db-path":
+        print(DB_PATH)
+    else:
+        print(f"unknown: {cmd}"); sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()
