@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""recall — redesigned vim-like terminal knowledge base with stable Textual UI."""
-
 import asyncio
 import os
 import re
@@ -24,7 +22,7 @@ from textual.containers import Container, Horizontal, ScrollableContainer
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static, TextArea
 
-# ── Nightfox-like palette ─────────────────────────────────────────────────────
+# ── Nightfox palette ─────────────────────────────────────────────────────
 
 PX = {
     "bg": "#050816",
@@ -644,6 +642,248 @@ HELP_TEXT = f"""\
   [{PX['muted']}]press any key to close[/{PX['muted']}]
 """
 
+class VimPreview(Static):
+    """
+    Full Vim-like preview widget for the main preview panel.
+    - Real motions with counts (5j, 3w, 10G, Ctrl+d, etc.)
+    - Visual mode (v / V / o)
+    - / find + n/N
+    """
+
+    def __init__(self, lines: list[str], app: "RecallApp", entry: dict):
+        super().__init__()
+        self.lines = lines or [""]
+        self._app = app
+        self.entry = entry  # needed for Y (meta yank)
+
+        # Vim state
+        self.cursor_line = 0
+        self.cursor_col = 0
+        self.visual_mode: Optional[str] = None
+        self.anchor_line = 0
+        self.anchor_col = 0
+        self.count = ""          # numeric prefix e.g. "5"
+        self.pending = ""        # for gg, ge, etc.
+        self.find_mode = False
+        self.find_query = ""
+        self.find_hits: list[tuple[int, int, int]] = []
+        self.find_index = -1
+
+    def render(self) -> Group:
+        """Render selectable preview with cursor + visual highlight."""
+        return render_selectable_preview(
+            self.lines,
+            self.cursor_line,
+            self.cursor_col,
+            self.visual_mode,
+            self.anchor_line,
+            self.anchor_col,
+        )
+
+    def handle_key(self, k: str, c: str) -> bool:
+        """Main key handler — returns True if we consumed the key."""
+        if self.find_mode:
+            return self._handle_find_key(k, c)
+
+        # ── Count prefix ─────────────────────────────────────
+        if k.isdigit():
+            self.count += k
+            return True
+
+        count = int(self.count) if self.count else 1
+        self.count = ""
+
+        # ── Escape / cancel visual ───────────────────────────
+        if k == "escape":
+            if self.visual_mode:
+                self.visual_mode = None
+                self.refresh()
+                return True
+            return False  # let RecallApp handle global escape
+
+        # ── Visual mode toggles ──────────────────────────────
+        if k == "v":
+            self._toggle_visual("char")
+            return True
+        if k == "V":
+            self._toggle_visual("line")
+            return True
+        if k == "o" and self.visual_mode:
+            self.anchor_line, self.cursor_line = self.cursor_line, self.anchor_line
+            self.anchor_col, self.cursor_col = self.cursor_col, self.anchor_col
+            self.refresh()
+            return True
+
+        # ── Yank (non-blocking) ──────────────────────────────
+        if k == "y":
+            self._app.call_later(self._yank_selection, False)
+            return True
+        if k == "Y":
+            self._app.call_later(self._yank_selection, True)
+            return True
+
+        # ── Find ─────────────────────────────────────────────
+        if k == "/":
+            self.find_mode = True
+            self.refresh()
+            return True
+        if k == "n":
+            self._jump_find(1)
+            return True
+        if k == "N":
+            self._jump_find(-1)
+            return True
+
+        # ── Pending 'g' commands (gg, ge) ────────────────────
+        if self.pending == "g":
+            self.pending = ""
+            if k == "g":
+                self.cursor_line = 0
+                self._sync_cursor_col()
+                self.refresh()
+                return True
+            if k == "e":
+                line = self.lines[self.cursor_line]
+                self.cursor_col = move_word_end_backward(line, self.cursor_col)
+                self.refresh()
+                return True
+        if k == "g":
+            self.pending = "g"
+            return True
+
+        # ── Motions (with count support) ─────────────────────
+        moved = True
+        if k in ("j", "down"):
+            self.cursor_line = max(0, min(len(self.lines) - 1, self.cursor_line + count))
+        elif k in ("k", "up"):
+            self.cursor_line = max(0, self.cursor_line - count)
+        elif k in ("h", "left"):
+            self.cursor_col = max(0, self.cursor_col - count)
+        elif k in ("l", "right"):
+            line = self.lines[self.cursor_line] if self.lines else ""
+            self.cursor_col = min(max(0, len(line) - 1), self.cursor_col + count)
+        elif k == "0":
+            self.cursor_col = 0
+        elif k == "$":
+            line = self.lines[self.cursor_line] if self.lines else ""
+            self.cursor_col = max(0, len(line) - 1)
+        elif k == "w":
+            line = self.lines[self.cursor_line] if self.lines else ""
+            for _ in range(count):
+                self.cursor_col = move_word_forward(line, self.cursor_col)
+        elif k == "b":
+            line = self.lines[self.cursor_line] if self.lines else ""
+            for _ in range(count):
+                self.cursor_col = move_word_backward(line, self.cursor_col)
+        elif k == "e":
+            line = self.lines[self.cursor_line] if self.lines else ""
+            for _ in range(count):
+                self.cursor_col = move_word_end_forward(line, self.cursor_col)
+        elif k in ("ctrl+f", "pagedown"):
+            self.cursor_line = max(0, min(len(self.lines) - 1, self.cursor_line + count * 16))
+        elif k in ("ctrl+b", "pageup"):
+            self.cursor_line = max(0, self.cursor_line - count * 16)
+        elif k == "ctrl+d":
+            self.cursor_line = max(0, min(len(self.lines) - 1, self.cursor_line + count * 8))
+        elif k == "ctrl+u":
+            self.cursor_line = max(0, self.cursor_line - count * 8)
+        elif k == "G":
+            self.cursor_line = max(0, len(self.lines) - 1)
+        else:
+            moved = False
+
+        if moved:
+            self.cursor_col = _clamp_col(self.lines, self.cursor_line, self.cursor_col)
+            self.refresh()   # immediate visual update
+            return True
+
+        return False   # not handled → let RecallApp try other keys
+
+    # ── Internal helpers (clean & self-contained) ─────────────
+    def _toggle_visual(self, mode: str):
+        if self.visual_mode == mode:
+            self.visual_mode = None
+        else:
+            self.visual_mode = mode
+            self.anchor_line = self.cursor_line
+            self.anchor_col = self.cursor_col
+        self.refresh()
+
+    def _sync_cursor_col(self):
+        self.cursor_col = _clamp_col(self.lines, self.cursor_line, self.cursor_col)
+
+    async def _async_clipboard(self, text: str, reg: str):
+        """Runs clipboard tools in background thread."""
+        if reg == '+':
+            status = yank_to_clipboard(text)
+        else:
+            status = yank_to_primary(text)
+        self._app._flash(status)
+        self._app._draw_bars()
+
+    def _yank_selection(self, with_meta: bool = False):
+        """Called via call_later → always yanks to + (system clipboard)."""
+        text = selected_preview_text(
+            self.lines,
+            self.visual_mode,
+            self.anchor_line,
+            self.anchor_col,
+            self.cursor_line,
+            self.cursor_col,
+            self.entry.get("content", "") if self.entry else "",
+        )
+        if with_meta and self.entry:
+            line_no = min(self.anchor_line, self.cursor_line) + 1 if self.visual_mode else self.cursor_line + 1
+            meta = f"{_display_path(self.entry)}:{line_no}:{self.cursor_col + 1}"
+            text = f"{meta}\n{text}" if text else meta
+
+        if not text:
+            self._app._flash("nothing to yank")
+            self._app._draw_bars()
+            return
+
+        # Always send to system clipboard (+), non-blocking
+        asyncio.create_task(self._async_clipboard(text, '+'))
+
+    def _handle_find_key(self, k: str, c: str) -> bool:
+        if k == "escape":
+            self.find_mode = False
+            self.refresh()
+            return True
+        if k == "enter":
+            self.find_mode = False
+            self._refresh_find_hits()
+            self._jump_find(1, restart=True)
+            return True
+        if k == "backspace":
+            self.find_query = self.find_query[:-1]
+            self._refresh_find_hits()
+            self.refresh()
+            return True
+        if c and len(c) == 1:
+            self.find_query += c
+            self._refresh_find_hits()
+            self.refresh()
+            return True
+        return False
+
+    def _refresh_find_hits(self):
+        self.find_hits = preview_search_hits(self.lines, self.find_query)
+        self.find_index = 0 if self.find_hits else -1
+
+    def _jump_find(self, step: int, restart: bool = False):
+        if restart:
+            self._refresh_find_hits()
+        if not self.find_hits:
+            self.refresh()
+            return
+        if not restart:
+            self.find_index = (self.find_index + step) % len(self.find_hits)
+        line_idx, start, _ = self.find_hits[self.find_index]
+        self.cursor_line = line_idx
+        self.cursor_col = start
+        self._sync_cursor_col()
+        self.refresh()
 
 class HelpModal(ModalScreen):
     DEFAULT_CSS = f"""
@@ -1280,6 +1520,7 @@ class RecallApp(App):
         self._registers.setdefault("0", "")
         self._active_register = '"'
         self._register_pending = False
+        self._vim_preview: Optional["VimPreview"] = None
 
     def compose(self) -> ComposeResult:
         yield Static("", id="menubar", markup=True)
@@ -1307,8 +1548,9 @@ class RecallApp(App):
         event.prevent_default()
         k = event.key
         c = event.character or ""
-        if self._preview_find_mode:
-            self._handle_preview_find_input(k, c)
+        if self._vim_preview and self._vim_preview.find_mode:
+            self._vim_preview._handle_find_key(k, c)
+            self._redraw()
             return
         {Mode.NORMAL: self._normal, Mode.SEARCH: self._search, Mode.COMMAND: self._command}[self._mode](k, c)
 
@@ -1322,8 +1564,10 @@ class RecallApp(App):
             else:
                 self._flash(f"invalid register: {target}")
             return
-        if self._preview_visual_mode:
-            if self._handle_preview_keys(k):
+        # Route all preview navigation (visual mode, find mode, motions) through VimPreview
+        if self._vim_preview and (self._vim_preview.visual_mode or self._vim_preview.find_mode):
+            if self._vim_preview.handle_key(k, c):
+                self._redraw()
                 return
         buf = self._kbuf
         if buf == "g" and k == "g":
@@ -1338,14 +1582,14 @@ class RecallApp(App):
             return
         if k == "y":
             self._kbuf = ""
-            if self._preview_lines:
-                self._flash(self._yank_preview_selection())
+            if self._vim_preview and self._vim_preview.visual_mode:
+                self.call_later(self._vim_preview._yank_selection, False)
             else:
                 self._do_yank()
             return
-        if k == "Y" and self._preview_lines:
+        if k == "Y" and self._vim_preview and self._vim_preview.visual_mode:
             self._kbuf = ""
-            self._flash(self._yank_preview_selection(with_meta=True))
+            self.call_later(self._vim_preview._yank_selection, True)
             return
         if k in ("g", "d"):
             self._kbuf = k
@@ -1659,7 +1903,6 @@ class RecallApp(App):
 
     def _render_menu_bar(self) -> str:
         palette = [PX["blue"], PX["cyan"], PX["green"], PX["yellow"]]
-        segs = [self._power_seg("MENU", PX["bg"], PX["fg"] if False else PX["blue"], PX["bg3"])]
         segs = [self._power_seg("MENU", PX["bg"], PX["blue"], PX["bg3"])]
         for i, name in enumerate(self._menu_items):
             bg = palette[i % len(palette)]
@@ -1711,10 +1954,10 @@ class RecallApp(App):
             body = f"[{PX['purple']}]register: \"█  choose + * 0-9 a-z[/{PX['purple']}]"
         elif self._kbuf:
             body = f"[{PX['purple']}]pending: {esc(self._kbuf)}[/{PX['purple']}]"
-        elif self._preview_visual_mode:
-            body = f"[{PX['yellow']}]preview visual {esc(self._preview_visual_mode)}[/{PX['yellow']}] [{PX['muted']}]j/k h/l 0 $ w b e ge Ctrl+f/b gg G / n N o y Y Esc[/{PX['muted']}]"
-        elif self._preview_find_mode:
-            body = f"[bold {PX['yellow']}]/[/bold {PX['yellow']}][{PX['fg']}]{esc(self._preview_find_query)}[/{PX['fg']}][bold {PX['yellow']}]█[/bold {PX['yellow']}]"
+        elif self._vim_preview and self._vim_preview.visual_mode:
+            body = f"[{PX['yellow']}]preview visual {esc(self._vim_preview.visual_mode)}[/{PX['yellow']}] [{PX['muted']}]j/k h/l 0 $ w b e ge Ctrl+f/b gg G / n N o y Y Esc[/{PX['muted']}]"
+        elif self._vim_preview and self._vim_preview.find_mode:
+            body = f"[bold {PX['yellow']}]/[/bold {PX['yellow']}][{PX['fg']}]{esc(self._vim_preview.find_query)}[/{PX['fg']}][bold {PX['yellow']}]█[/bold {PX['yellow']}]"
         else:
             body = f"[{PX['muted']}]j/k move  gg/G jump  Enter view  \" register  v/V preview-select  / preview-find  y/Y preview-yank  a add  e edit  dd delete  : commands  ? help[/{PX['muted']}]"
         return f"{self._render_powerline(body)}\n{body}"
@@ -1806,24 +2049,16 @@ class RecallApp(App):
             f"[bold {PX['cyan']}] PREVIEW [/bold {PX['cyan']}]\n"
             f"[{cc}] {CAT_LABEL[cat]} [/{cc}]  [bold {PX['fg']}]{esc(entry['title'])}[/bold {PX['fg']}]"
         )
-
     def _render_preview_body(self):
         entry = self._cur()
         if not entry:
             return f"\n  [{PX['muted']}]Nothing selected.[/{PX['muted']}]"
+
         self._ensure_preview_state(entry)
-        if self._preview_lines:
-            return render_selectable_preview(
-                self._preview_lines,
-                self._preview_cursor_line,
-                self._preview_cursor_col,
-                self._preview_visual_mode,
-                self._preview_anchor_line,
-                self._preview_anchor_col,
-            )
+        if self._vim_preview:          # ← new
+            return self._vim_preview.render()
         width = max(70, self.size.width - 44)
         return render_preview(entry, width, self._search_q)
-
     def _sync_scroll(self):
         lsc = self.query_one("#list-scroll", ScrollableContainer)
         current = self._cur()
@@ -1845,19 +2080,11 @@ class RecallApp(App):
 
     def _ensure_preview_state(self, entry: dict) -> None:
         entry_id = entry.get("id")
-        if self._preview_entry_id != entry_id:
+        if getattr(self, '_preview_entry_id', None) != entry_id:
             self._preview_entry_id = entry_id
-            self._preview_lines = build_preview_lines(entry)
-            self._preview_cursor_line = 0
-            self._preview_cursor_col = 0
-            self._preview_visual_mode = None
-            self._preview_anchor_line = 0
-            self._preview_anchor_col = 0
-            self._preview_find_mode = False
-            self._preview_find_query = ""
-            self._preview_find_hits = []
-            self._preview_find_index = -1
-
+            lines = build_preview_lines(entry)
+            self._vim_preview = VimPreview(lines, self, entry)
+    
     def _reset_preview_state(self) -> None:
         self._preview_entry_id = None
         self._preview_lines = []
@@ -1870,15 +2097,14 @@ class RecallApp(App):
         self._preview_find_query = ""
         self._preview_find_hits = []
         self._preview_find_index = -1
+        self._vim_preview = None
 
     def _activate_preview_visual(self, mode: str) -> None:
         entry = self._cur()
         if not entry:
             return
         self._ensure_preview_state(entry)
-        self._preview_visual_mode = mode
-        self._preview_anchor_line = self._preview_cursor_line
-        self._preview_anchor_col = self._preview_cursor_col
+        self._vim_preview._toggle_visual(mode)
         self._redraw()
 
     def _handle_preview_keys(self, k: str) -> bool:
