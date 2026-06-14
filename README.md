@@ -85,7 +85,6 @@ Single SQLite file. Back it up with `cp` or rsync. Portable across machines.
 ## Clipboard
 
 Yank (Ctrl+Y) uses the first available tool in: `xclip` → `xsel` → `wl-copy`.  
-On Kali: `sudo apt install xclip`
 
 ## Building the Rust binary manually
 
